@@ -90,6 +90,17 @@ const TYPE: 'design:type' = 'design:type';
 
 type TypeModifier = 'NON_NULL' | 'LIST';
 
+function applyModifiers(type: Function | GraphQLType, modifiers: TypeModifier[]) {
+  return modifiers.reduce((type, modifier) => {
+    switch (modifier) {
+      case 'LIST':
+        return new GraphQLList(type);
+      case 'NON_NULL':
+        return new GraphQLNonNull(type);
+    }
+  }, typeOf(type));
+}
+
 class ArgumentConfig {
   public name: string;
   public type: GraphQLType | Function;
@@ -97,27 +108,27 @@ class ArgumentConfig {
   public defaultValue?: any;
   public description?: string;
 
-  public toConfig(): { [name: string]: GraphQLArgumentConfig } {
-    const type = this.typeModifiers.reduce((type, modifier) => {
-      switch (modifier) {
-        case 'LIST':
-          return new GraphQLList(type);
-        case 'NON_NULL':
-          return new GraphQLNonNull(type);
-      }
-    }, typeOf(this.type));
+  public toConfig(): [string, GraphQLArgumentConfig ] {
+    const type = applyModifiers(this.type, this.typeModifiers);
 
-    return {
-      [this.name]: {
+    return [
+      this.name,
+      {
         type: (type as GraphQLInputType),
         defaultValue: this.defaultValue,
         description: this.description,
       }
-    };
+    ];
   }
 }
 
 class FieldConfig {
+  constructor(public propertyKey: string | symbol) {
+    if (typeof this.propertyKey === 'string') {
+      this.name = this.propertyKey;
+    }
+  };
+
   public name: string;
   public type: GraphQLType | Function;
   public typeModifiers: TypeModifier[] = [];
@@ -126,28 +137,38 @@ class FieldConfig {
   public deprecationReason?: string;
 
   public toConfig(): { [name: string]: GraphQLFieldConfig } {
-    const type = this.typeModifiers.reduce((type, modifier) => {
-      switch (modifier) {
-        case 'LIST':
-          return new GraphQLList(type);
-        case 'NON_NULL':
-          return new GraphQLNonNull(type);
-      }
-    }, typeOf(this.type));
+    const type = applyModifiers(this.type, this.typeModifiers);
+    const [args, indexMap] = this.getArgumtentConfigAndIndexMap();
 
     return {
       [this.name]: {
         type: (type as GraphQLOutputType),
-        args: this.getArgumtentConfigMap(),
+        args,
         description: this.description,
+        resolve: (value: any, args: { [name: string]: any }) => {
+          const property = value[this.propertyKey];
+          if (typeof property === 'function') {
+            const argList = indexMap.map((name) => args[name]);
+            return property.apply(value, argList);
+          }
+
+          return property;
+        }
       }
     };
   }
 
-  private getArgumtentConfigMap() {
-    return Object.assign.apply(null, [{}].concat(Object.keys(this.arguments).map((index) => {
-      return this.arguments[index].toConfig();
-    })));
+  private getArgumtentConfigAndIndexMap(): [ { [name: string]: GraphQLArgumentConfig }, string[] ] {
+    const argumentConfig: { [name: string]: GraphQLArgumentConfig } = {};
+    const indexMap: string[] = [];
+
+    Object.keys(this.arguments).forEach((index) => {
+      const [name, config] = this.arguments[index].toConfig();
+      argumentConfig[name] = config;
+      indexMap[~~index] = name;
+    });
+
+    return [argumentConfig, indexMap];
   }
 }
 
@@ -186,10 +207,7 @@ abstract class MemberMetadata {
 
   public get fieldConfig(): FieldConfig {
     if (!Object.hasOwnProperty.call(this.typeConfig.fields, this.propertyKey)) {
-      const config = new FieldConfig();
-      if (typeof this.propertyKey === 'string') {
-        config.name = this.propertyKey;
-      }
+      const config = new FieldConfig(this.propertyKey);
       config.type = this.type;
 
       this.typeConfig.fields[this.propertyKey] = config;
@@ -228,30 +246,45 @@ class TypeConfig {
   public description?: string;
   public fields: { [propertyKey: string]: FieldConfig } = {};
 
+  public constructor(parent: TypeConfig | undefined) {
+    if (parent !== undefined) {
+      Object.setPrototypeOf(this, parent);
+      this.fields = Object.create(parent.fields);
+    }
+  }
+
   public toConfig() {
+    const fieldList: { [name: string]: Object }[] = [];
+    for (let propertyKey in this.fields) {
+      fieldList.push(this.fields[propertyKey].toConfig());
+    }
+
     const config = {
       name: this.name,
       description: this.description,
       fields: () => (
-        Object.assign.apply(null, [{}].concat(
-          Object.keys(this.fields).
-            map((propertyKey) => this.fields[propertyKey].toConfig())))
-      )
+        Object.assign.apply(null, [{}].concat(fieldList)))
     };
 
     return config;
   }
 }
 
+const _rootFunction = Object.getPrototypeOf(Object);
 class ClassMetadata {
   constructor(public target: Function) { }
 
   public get typeConfig(): TypeConfig {
-    if (!Reflect.hasMetadata(META_TYPE, this.target)) {
-      const initialData = new TypeConfig();
-      initialData.name = this.target.name;
+    if (!Reflect.hasOwnMetadata(META_TYPE, this.target)) {
+      const parent = Object.getPrototypeOf(this.target);
+      let parentConfig: TypeConfig | undefined;
+      if (parent !== _rootFunction) {
+        parentConfig = new ClassMetadata(parent).typeConfig;
+      }
+      const config = new TypeConfig(parentConfig);
+      config.name = this.target.name;
 
-      Reflect.defineMetadata(META_TYPE, initialData, this.target);
+      Reflect.defineMetadata(META_TYPE, config, this.target);
     }
 
     return Reflect.getMetadata(META_TYPE, this.target);
@@ -273,11 +306,23 @@ function typeName(name: string): ClassDecorator {
 }
 
 function field(name?: string): MethodDecorator & PropertyDecorator {
-  return function <T>(target: Object, propertyKey: string | symbol) {
-    if (!name) { return; }
-    new ClassMetadata(target.constructor).
-      methodMetadata(propertyKey).
+  return function <T>(target: Object, propertyKey: string | symbol, third?: TypedPropertyDescriptor<T>) {
+    const classMetadata = new ClassMetadata(target.constructor);
+    let fieldConfig: FieldConfig;
+    if (third === undefined) {
+      // prop
+      fieldConfig = classMetadata.
+        propertyMetadata(propertyKey).
+        fieldConfig;
+    } else {
+      // method
+      fieldConfig = classMetadata.
+        methodMetadata(propertyKey).
+        fieldConfig;
+    }
+    if (name) {
       fieldConfig.name = name;
+    }
   };
 }
 
