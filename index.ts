@@ -457,7 +457,10 @@ function typeOf(ctor: Function | GraphQLType): GraphQLType {
 
   const metadata = new ClassMetadata(ctor);
   const config = metadata.typeConfig.toConfig();
-  return new GraphQLObjectType(config);
+  const type = new GraphQLObjectType(config);
+  typeCache.set(ctor, type);
+
+  return type;
 }
 
 export {
